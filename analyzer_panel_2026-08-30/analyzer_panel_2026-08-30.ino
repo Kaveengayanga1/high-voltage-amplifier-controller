@@ -1,24 +1,24 @@
 /*
- * SIGNAL ANALYZER PANEL — rev 3 — 2026-08-30
+ * SIGNAL ANALYZER PANEL — rev 3.1 (UI card layout) — 2026-08-31
  * STM32F411 Black Pill + 3.5" ILI9488 480x320 TFT shield (8-bit parallel)
  *
- * PIN MAP rev 3 (matches WIRING.md and User_Setup.h dated 2026-08-30):
- *   PA0        Signal input  (ADC1_IN0)  — via divider/protection network
- *   PA1        Thermistor    (ADC1_IN1)  — 3.3V -> Rseries -> PA1 -> NTC -> GND
+ * PIN MAP rev 3 (unchanged, matches WIRING.md and User_Setup.h 2026-08-30):
+ *   PA0        Signal input  (ADC1_IN0)
+ *   PA1        Thermistor    (ADC1_IN1)
  *   PA2..PA5   GAIN mode inputs 1..4 (digital in, active HIGH by default)
- *   PA6        Fan PWM (reserved, not used here)
+ *   PA6        Fan PWM (reserved)
  *   PB0..PB7   LCD D0..D7
  *   PB9  CS | PB10 DC | PB12 RST | PB13 WR | PB14 RD
  *
- * Interface shows: waveform type, frequency, INPUT VOLTAGE (Vpp + mean),
- * GAIN MODE (from PA2-PA5), temperature, mini scope trace.
+ * rev 3.1 UI: separate rounded-corner cards per parameter, no overlap,
+ * N/A fallbacks, units (Hz / V / °C), scope + waveform cards on the right.
  */
 
 #include <TFT_eSPI.h>
 #include "analyzer_types.h"
 TFT_eSPI tft = TFT_eSPI();
 
-// ---------------- Pins (rev 3, 2026-08-30) ----------------
+// ---------------- Pins (rev 3) ----------------
 #define SIG_PIN     PA0
 #define THERM_PIN   PA1
 const int GAIN_PINS[4] = {PA2, PA3, PA4, PA5};
@@ -26,7 +26,7 @@ const int GAIN_PINS[4] = {PA2, PA3, PA4, PA5};
 
 // ---------------- Input scaling ----------------
 #define VREF        3.3f
-#define INPUT_ATTEN 1.0f     // set to your divider ratio (e.g. 7.8f) to show TRUE input volts
+#define INPUT_ATTEN 1.0f     // set to divider ratio (e.g. 7.8f) for TRUE input volts
 
 // ---------------- Thermistor — CONFIRM THESE ----------------
 #define THERM_R25      10000.0f
@@ -46,24 +46,97 @@ static uint16_t buf[NSAMP];
 const char* waveNames[]  = {"NO SIGNAL", "SINE", "SQUARE", "TRIANGLE", "RAMP", "OTHER"};
 const uint16_t waveColors[] = {TFT_DARKGREY, TFT_CYAN, TFT_YELLOW, TFT_GREEN, TFT_ORANGE, TFT_RED};
 
-// ---------------- Layout (480x320 landscape) ----------------
-#define HDR_H    32
-#define COL_X    12
-#define VAL_X    12
-#define ROW_WAVE 44
-#define ROW_FREQ 104
-#define ROW_VIN  164
-#define ROW_GAIN 224
-#define ROW_TEMP 274
-#define SCOPE_X  262
-#define SCOPE_Y  52
-#define SCOPE_W  206
-#define SCOPE_H  90
+// ================= UI LAYOUT (480x320 landscape) =================
+// Header bar across the top; 4 stat cards in the left column;
+// scope card + waveform card in the right column. No region overlaps.
+#define HDR_H     28
 
+#define CARD_X     8          // left column
+#define CARD_W   230
+#define CARD_H    64
+#define CARD_GAP   6
+#define CARD_R     8          // corner radius
+#define CARD_Y(i)  (HDR_H + 6 + (i) * (CARD_H + CARD_GAP))   // i = 0..3
+// card 0 FREQUENCY, 1 INPUT VOLTAGE, 2 GAIN MODE, 3 TEMPERATURE
+// last card ends at 34 + 4*70 - 6 = 308 < 320  ✔
+
+#define RCOL_X   246          // right column
+#define RCOL_W   226
+#define SCOPE_CY  (HDR_H + 6)          // scope card
+#define SCOPE_CH 140
+#define WAVE_CY   (SCOPE_CY + SCOPE_CH + CARD_GAP)   // waveform card
+#define WAVE_CH  (320 - WAVE_CY - 6)                 // fills to bottom
+
+// scope plotting area (inside scope card, below its label)
+#define SCOPE_X  (RCOL_X + 6)
+#define SCOPE_Y  (SCOPE_CY + 24)
+#define SCOPE_W  (RCOL_W - 12)
+#define SCOPE_H  (SCOPE_CH - 30)
+
+#define BORDER_COL  0x39E7    // dark grey border
+#define LABEL_COL   TFT_LIGHTGREY
+
+// ---------------- change-detection state ----------------
 WaveType lastWave = (WaveType)255;
 float lastFreq = -999, lastVpp = -999, lastMean = -999, lastTemp = -999;
 int lastGain = -1;
+bool lastTempNA = false, lastVinNA = false;
 
+// ================= UI helpers =================
+
+// Draw one card frame + its label (called once in setup)
+void drawCard(int x, int y, int w, int h, const char* label) {
+  tft.drawRoundRect(x, y, w, h, CARD_R, BORDER_COL);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(LABEL_COL, TFT_BLACK);
+  tft.drawString(label, x + 10, y + 7, 2);          // Font 2, 16 px
+}
+
+// Replace the value area of left-column card i with string s (Font 4, 26 px)
+void cardValue(int i, const char* s, uint16_t color) {
+  int x = CARD_X, y = CARD_Y(i);
+  tft.fillRect(x + 4, y + 27, CARD_W - 8, CARD_H - 31, TFT_BLACK); // clear inside border only
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(s, x + 12, y + 30, 4);
+}
+
+// Temperature value with a real ° symbol (drawn circle — fonts lack °)
+void cardTemp(float t) {
+  int x = CARD_X, y = CARD_Y(3);
+  tft.fillRect(x + 4, y + 27, CARD_W - 8, CARD_H - 31, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+  if (isnan(t)) { tft.drawString("N/A", x + 12, y + 30, 4); return; }
+  char s[16]; snprintf(s, sizeof(s), "%.1f", t);
+  int w = tft.drawString(s, x + 12, y + 30, 4);
+  int cx = x + 12 + w + 6;
+  tft.drawCircle(cx, y + 33, 3, TFT_SKYBLUE);       // ° symbol
+  tft.drawCircle(cx, y + 33, 2, TFT_SKYBLUE);
+  tft.drawString("C", cx + 7, y + 30, 4);
+}
+
+// Big centered waveform name in the right-hand waveform card
+void waveValue(WaveType w) {
+  int x = RCOL_X, y = WAVE_CY;
+  // Clear the full card area (old x2 text overflowed the borders), then
+  // redraw the frame + label to repair any damage.
+  tft.fillRect(x, y, RCOL_W, WAVE_CH, TFT_BLACK);
+  drawCard(x, y, RCOL_W, WAVE_CH, "WAVEFORM");
+
+  if (w == W_NOSIG) return;                         // no signal -> empty card
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(waveColors[w], TFT_BLACK);
+  // Use x2 only if the name fits inside the card, otherwise x1
+  tft.setTextSize(2);
+  if (tft.textWidth(waveNames[w], 4) > RCOL_W - 16) tft.setTextSize(1);
+  tft.drawString(waveNames[w], x + RCOL_W / 2, y + 27 + (WAVE_CH - 31) / 2, 4);
+  tft.setTextSize(1);
+  tft.setTextDatum(TL_DATUM);
+}
+
+// ================= Setup =================
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
@@ -76,22 +149,30 @@ void setup() {
   tft.setRotation(1);            // 480 x 320
   tft.fillScreen(TFT_BLACK);
 
+  // Header
   tft.fillRect(0, 0, 480, HDR_H, TFT_NAVY);
   tft.setTextColor(TFT_WHITE, TFT_NAVY);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("SIGNAL ANALYZER  rev3  2026-08-30", 240, HDR_H / 2, 2);
-
+  tft.drawString("SIGNAL ANALYZER  rev3.1  2026-08-31", 240, HDR_H / 2, 2);
   tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString("WAVEFORM",    COL_X, ROW_WAVE, 2);
-  tft.drawString("FREQUENCY",   COL_X, ROW_FREQ, 2);
-  tft.drawString("INPUT",       COL_X, ROW_VIN,  2);
-  tft.drawString("GAIN MODE",   COL_X, ROW_GAIN, 2);
-  tft.drawString("TEMPERATURE", COL_X, ROW_TEMP, 2);
-  tft.drawRect(SCOPE_X - 1, SCOPE_Y - 1, SCOPE_W + 2, SCOPE_H + 2, TFT_DARKGREY);
+
+  // Cards (frames + labels drawn once)
+  drawCard(CARD_X, CARD_Y(0), CARD_W, CARD_H, "FREQUENCY");
+  drawCard(CARD_X, CARD_Y(1), CARD_W, CARD_H, "INPUT VOLTAGE");
+  drawCard(CARD_X, CARD_Y(2), CARD_W, CARD_H, "GAIN MODE");
+  drawCard(CARD_X, CARD_Y(3), CARD_W, CARD_H, "TEMPERATURE");
+  drawCard(RCOL_X, SCOPE_CY, RCOL_W, SCOPE_CH, "SCOPE");
+  drawCard(RCOL_X, WAVE_CY,  RCOL_W, WAVE_CH,  "WAVEFORM");
+
+  // Initial fallback values
+  cardValue(0, "N/A", TFT_WHITE);
+  cardValue(1, "N/A", TFT_MAGENTA);
+  cardValue(2, "N/A", TFT_GOLD);
+  cardTemp(NAN);
+  waveValue(W_NOSIG);
 }
 
-// ---------------- Acquisition ----------------
+// ---------------- Acquisition (unchanged) ----------------
 float sampleSignal() {                       // returns sample rate (SPS)
   uint32_t t0 = micros();
   for (int i = 0; i < NSAMP; i++) buf[i] = analogRead(SIG_PIN);
@@ -161,9 +242,11 @@ float readTemperature() {
   return tK - 273.15f;
 }
 
-// ---------------- Display ----------------
+// ================= Display update =================
 void drawScope() {
   tft.fillRect(SCOPE_X, SCOPE_Y, SCOPE_W, SCOPE_H, TFT_BLACK);
+  // faint mid line for reference
+  tft.drawFastHLine(SCOPE_X, SCOPE_Y + SCOPE_H / 2, SCOPE_W, 0x2104);
   int step = NSAMP / SCOPE_W, py = 0;
   for (int x = 0; x < SCOPE_W; x++) {
     int y = SCOPE_Y + SCOPE_H - 1 - (buf[x * step] * (SCOPE_H - 1)) / 4095;
@@ -172,55 +255,57 @@ void drawScope() {
   }
 }
 
-void bigValue(const char* s, int y, uint16_t color) {
-  tft.fillRect(0, y + 16, 250, 30, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(color, TFT_BLACK);
-  tft.setTextSize(2);                       // Font 4 x2 (Font 6 lacks letters!)
-  tft.drawString(s, VAL_X, y + 16, 4);
-  tft.setTextSize(1);
-}
-
 void updateDisplay(WaveType w, float freq, const Features& f, int gain, float temp) {
-  char s[32];
+  char s[24];
 
-  if (w != lastWave) { bigValue(waveNames[w], ROW_WAVE, waveColors[w]); lastWave = w; }
+  // WAVEFORM (right card)
+  if (w != lastWave) { waveValue(w); lastWave = w; }
 
+  // FREQUENCY
   if (fabsf(freq - lastFreq) > 0.5f) {
-    if (freq >= 1000)     snprintf(s, sizeof(s), "%.2f kHz ", freq / 1000);
-    else if (freq > 0)    snprintf(s, sizeof(s), "%.1f Hz   ", freq);
-    else                  snprintf(s, sizeof(s), "---       ");
-    bigValue(s, ROW_FREQ, TFT_WHITE);
+    if (freq >= 1000)   snprintf(s, sizeof(s), "%.2f kHz", freq / 1000);
+    else if (freq > 0)  snprintf(s, sizeof(s), "%.1f Hz", freq);
+    else                snprintf(s, sizeof(s), "N/A");
+    cardValue(0, s, TFT_WHITE);
     lastFreq = freq;
   }
 
+  // INPUT VOLTAGE — N/A when no measurable signal
+  bool vinNA = (f.vpp < MIN_VPP_COUNTS);
   float vpp  = f.vpp  * VREF / 4095.0f * INPUT_ATTEN;
   float vavg = f.mean * VREF / 4095.0f * INPUT_ATTEN;
-  if (fabsf(vpp - lastVpp) > 0.02f || fabsf(vavg - lastMean) > 0.02f) {
-    snprintf(s, sizeof(s), "%.2fVpp %.2fV ", vpp, vavg);
-    tft.fillRect(0, ROW_VIN + 16, 250, 26, TFT_BLACK);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
-    tft.drawString(s, VAL_X, ROW_VIN + 16, 4);   // 1x font 4 (fits Vpp + avg)
-    lastVpp = vpp; lastMean = vavg;
+  if (vinNA != lastVinNA ||
+      (!vinNA && (fabsf(vpp - lastVpp) > 0.02f || fabsf(vavg - lastMean) > 0.02f))) {
+    if (vinNA) snprintf(s, sizeof(s), "N/A");
+    else       snprintf(s, sizeof(s), "%.2f Vpp", vpp);
+    cardValue(1, s, TFT_MAGENTA);
+    if (!vinNA) {                                     // avg on 2nd line, small font
+      char s2[16]; snprintf(s2, sizeof(s2), "avg %.2f V", vavg);
+      tft.setTextColor(LABEL_COL, TFT_BLACK);
+      tft.drawString(s2, CARD_X + 140, CARD_Y(1) + 9, 2);
+    } else {
+      tft.fillRect(CARD_X + 138, CARD_Y(1) + 7, CARD_W - 144, 18, TFT_BLACK);
+    }
+    lastVpp = vpp; lastMean = vavg; lastVinNA = vinNA;
   }
 
+  // GAIN MODE
   if (gain != lastGain) {
-    if (gain > 0) snprintf(s, sizeof(s), "MODE %d ", gain);
-    else          snprintf(s, sizeof(s), "NONE   ");
-    bigValue(s, ROW_GAIN, TFT_GOLD);
+    if (gain > 0) snprintf(s, sizeof(s), "MODE %d", gain);
+    else          snprintf(s, sizeof(s), "N/A");
+    cardValue(2, s, TFT_GOLD);
     lastGain = gain;
   }
 
-  if (isnan(temp)) snprintf(s, sizeof(s), "SENSOR?  ");
-  else             snprintf(s, sizeof(s), "%.1f C   ", temp);
-  if (fabsf(temp - lastTemp) > 0.05f || isnan(temp)) {
-    bigValue(s, ROW_TEMP, TFT_SKYBLUE);
-    lastTemp = temp;
+  // TEMPERATURE
+  bool tNA = isnan(temp);
+  if (tNA != lastTempNA || (!tNA && fabsf(temp - lastTemp) > 0.05f)) {
+    cardTemp(temp);
+    lastTemp = temp; lastTempNA = tNA;
   }
 }
 
-// ---------------- Main loop ----------------
+// ================= Main loop =================
 uint32_t lastTempMs = 0;
 float temperature = NAN;
 
