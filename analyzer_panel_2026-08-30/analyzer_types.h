@@ -7,6 +7,7 @@ enum WaveType { W_NOSIG, W_SINE, W_SQUARE, W_TRIANGLE, W_RAMP, W_OTHER };
 
 struct Features {
   float mean, vpp, rms, crest, sym;
+  float kurt;                 // normalized 4th moment: m4/m2^2 (shape feature)
   uint16_t vmin, vmax;
 };
 

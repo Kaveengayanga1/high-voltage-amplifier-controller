@@ -26,7 +26,9 @@ const int GAIN_PINS[4] = {PA2, PA3, PA4, PA5};
 
 // ---------------- Input scaling ----------------
 #define VREF        3.3f
-#define INPUT_ATTEN 1.0f     // set to divider ratio (e.g. 7.8f) for TRUE input volts
+#define INPUT_ATTEN 1.0f     // divider ratio for TRUE input volts:
+                             // direct = 1.0f | 10k/10k = 2.0f | 68k/10k = 7.8f
+                             // (classification is shape-based; ATTEN does not affect it)
 
 // ---------------- Thermistor — CONFIRM THESE ----------------
 #define THERM_R25      10000.0f
@@ -38,10 +40,15 @@ const int GAIN_PINS[4] = {PA2, PA3, PA4, PA5};
 #define NSAMP 512
 static uint16_t buf[NSAMP];
 #define MIN_VPP_COUNTS 80
-#define CF_SQUARE_MAX  1.20f
-#define CF_SINE_MAX    1.55f
-#define CF_TRI_MAX     1.90f
-#define SYM_TOL        0.10f
+
+// Kurtosis (m4/m2^2) is the primary shape feature — averaged over all 512
+// samples, so single noisy ADC samples can't flip the class (unlike crest).
+// Theoretical: square 1.0 | sine 1.5 | triangle 1.8. Tune from Serial "kurt=".
+#define KURT_SQUARE_MAX  1.30f
+#define KURT_SINE_MAX    1.68f
+#define KURT_TRI_MAX     2.10f
+#define WAVE_CONFIRM_COUNT 3   // consecutive buffers to accept a new class
+// (crest-factor thresholds removed — crest kept in Features for debug only)
 
 const char* waveNames[]  = {"NO SIGNAL", "SINE", "SQUARE", "TRIANGLE", "RAMP", "OTHER"};
 const uint16_t waveColors[] = {TFT_DARKGREY, TFT_CYAN, TFT_YELLOW, TFT_GREEN, TFT_ORANGE, TFT_RED};
@@ -189,26 +196,49 @@ Features computeFeatures() {
   }
   f.mean = (float)sum / NSAMP;
   f.vpp  = f.vmax - f.vmin;
-  float sumsq = 0; int above = 0;
+  float sum2 = 0, sum4 = 0; int above = 0;
   for (int i = 0; i < NSAMP; i++) {
-    float d = buf[i] - f.mean;
-    sumsq += d * d;
+    float d  = buf[i] - f.mean;      // float BEFORE ^4 — int d^4 would overflow
+    float d2 = d * d;
+    sum2 += d2;
+    sum4 += d2 * d2;
     if (buf[i] > f.mean) above++;
   }
-  f.rms = sqrtf(sumsq / NSAMP);
+  float m2 = sum2 / NSAMP;
+  float m4 = sum4 / NSAMP;
+  f.rms  = sqrtf(m2);
+  f.kurt = (m2 > 1.0f) ? m4 / (m2 * m2) : 0;   // == avg of ((x-mean)/rms)^4
   float peak = max(f.vmax - f.mean, f.mean - f.vmin);
-  f.crest = (f.rms > 1.0f) ? peak / f.rms : 0;
+  f.crest = (f.rms > 1.0f) ? peak / f.rms : 0; // kept for debug only
   f.sym = (float)above / NSAMP;
   return f;
 }
 
+// Kurtosis-based classifier. RAMP no longer returned (enum kept for compat).
 WaveType classify(const Features& f) {
-  if (f.vpp < MIN_VPP_COUNTS) return W_NOSIG;
-  if (f.crest < CF_SQUARE_MAX) return W_SQUARE;
-  if (f.crest < CF_SINE_MAX)   return W_SINE;
-  if (f.crest < CF_TRI_MAX)
-    return (fabsf(f.sym - 0.5f) < SYM_TOL) ? W_TRIANGLE : W_RAMP;
+  if (f.vpp < MIN_VPP_COUNTS)      return W_NOSIG;
+  if (f.kurt < KURT_SQUARE_MAX)    return W_SQUARE;
+  if (f.kurt < KURT_SINE_MAX)      return W_SINE;
+  if (f.kurt < KURT_TRI_MAX)       return W_TRIANGLE;
   return W_OTHER;
+}
+
+// Temporal stabilizer: a new class must repeat WAVE_CONFIRM_COUNT buffers
+// before the display changes. NO SIGNAL is accepted after 2 (input removed
+// should show promptly, but one dropout buffer still can't blank the card).
+WaveType stabilizeWave(WaveType newWave) {
+  static WaveType candidate = W_NOSIG;
+  static WaveType stable    = W_NOSIG;
+  static uint8_t  count     = 0;
+  if (newWave == candidate) {
+    if (count < 255) count++;
+  } else {
+    candidate = newWave;
+    count = 1;
+  }
+  uint8_t need = (candidate == W_NOSIG) ? 2 : WAVE_CONFIRM_COUNT;
+  if (count >= need) stable = candidate;
+  return stable;
 }
 
 float measureFreq(const Features& f, float fs) {
@@ -312,7 +342,8 @@ float temperature = NAN;
 void loop() {
   float fs = sampleSignal();
   Features f = computeFeatures();
-  WaveType w = classify(f);
+  WaveType rawWave = classify(f);
+  WaveType w = stabilizeWave(rawWave);
   float freq = measureFreq(f, fs);
   int gain = readGainMode();
 
@@ -323,10 +354,14 @@ void loop() {
 
   Serial.print("fs="); Serial.print(fs, 0);
   Serial.print(" vpp="); Serial.print(f.vpp, 0);
+  Serial.print(" mean="); Serial.print(f.mean, 1);
+  Serial.print(" rms="); Serial.print(f.rms, 1);
   Serial.print(" crest="); Serial.print(f.crest, 3);
+  Serial.print(" kurt="); Serial.print(f.kurt, 3);
   Serial.print(" sym="); Serial.print(f.sym, 3);
   Serial.print(" gain="); Serial.print(gain);
-  Serial.print(" -> "); Serial.print(waveNames[w]);
+  Serial.print(" raw="); Serial.print(waveNames[rawWave]);
+  Serial.print(" stable="); Serial.print(waveNames[w]);
   Serial.print(" f="); Serial.print(freq, 1);
   Serial.print("Hz T="); Serial.println(temperature, 2);
 
