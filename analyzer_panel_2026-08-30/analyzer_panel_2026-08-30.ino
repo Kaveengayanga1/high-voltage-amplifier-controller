@@ -270,23 +270,23 @@ void updateDisplay(WaveType w, float freq, const Features& f, int gain, float te
     lastFreq = freq;
   }
 
-  // INPUT VOLTAGE — N/A when no measurable signal
-  bool vinNA = (f.vpp < MIN_VPP_COUNTS);
+  // INPUT VOLTAGE — AC signal: show Vpp (+avg small); DC/no signal: show DC level
+  bool dcOnly = (f.vpp < MIN_VPP_COUNTS);
   float vpp  = f.vpp  * VREF / 4095.0f * INPUT_ATTEN;
   float vavg = f.mean * VREF / 4095.0f * INPUT_ATTEN;
-  if (vinNA != lastVinNA ||
-      (!vinNA && (fabsf(vpp - lastVpp) > 0.02f || fabsf(vavg - lastMean) > 0.02f))) {
-    if (vinNA) snprintf(s, sizeof(s), "N/A");
-    else       snprintf(s, sizeof(s), "%.2f Vpp", vpp);
+  if (dcOnly != lastVinNA ||
+      fabsf(vpp - lastVpp) > 0.02f || fabsf(vavg - lastMean) > 0.02f) {
+    if (dcOnly) snprintf(s, sizeof(s), "%.2f V", vavg);      // DC level
+    else        snprintf(s, sizeof(s), "%.2f Vpp", vpp);
     cardValue(1, s, TFT_MAGENTA);
-    if (!vinNA) {                                     // avg on 2nd line, small font
+    tft.fillRect(CARD_X + 130, CARD_Y(1) + 7, CARD_W - 136, 18, TFT_BLACK);
+    tft.setTextColor(LABEL_COL, TFT_BLACK);
+    if (dcOnly) tft.drawString("DC", CARD_X + 140, CARD_Y(1) + 9, 2);
+    else {
       char s2[16]; snprintf(s2, sizeof(s2), "avg %.2f V", vavg);
-      tft.setTextColor(LABEL_COL, TFT_BLACK);
       tft.drawString(s2, CARD_X + 140, CARD_Y(1) + 9, 2);
-    } else {
-      tft.fillRect(CARD_X + 138, CARD_Y(1) + 7, CARD_W - 144, 18, TFT_BLACK);
     }
-    lastVpp = vpp; lastMean = vavg; lastVinNA = vinNA;
+    lastVpp = vpp; lastMean = vavg; lastVinNA = dcOnly;
   }
 
   // GAIN MODE
