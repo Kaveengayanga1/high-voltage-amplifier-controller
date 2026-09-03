@@ -409,7 +409,6 @@
 // }
 
 
-
 /*
  * SIGNAL ANALYZER PANEL — rev 3.2 (float display fix) — 2026-08-31
  * STM32F411 Black Pill + 3.5" ILI9488 480x320 TFT shield (8-bit parallel)
@@ -443,11 +442,46 @@ const int GAIN_PINS[4] = { PA2, PA3, PA4, PA5 };
                           // direct = 1.0f | 10k/10k = 2.0f | 68k/10k = 7.8f
                           // classification is shape-based; ATTEN does not affect it
 
-// ---------------- Thermistor — CONFIRM THESE ----------------
-#define THERM_R25 10000.0f
-#define THERM_BETA 3950.0f
-#define THERM_RSERIES 10000.0f
-#define T0_KELVIN 298.15f
+// ---------------- Thermistor calibration ----------------
+// Wiring: 3.3 V -> fixed resistor -> PA1 -> NTC -> GND
+// IMPORTANT: set these to the values measured with a multimeter for best accuracy.
+#define THERM_RSERIES_OHM 10000.0f   // actual fixed resistor value
+#define THERM_SUPPLY_V    3.300f     // voltage feeding the divider (AMS1117 output)
+#define THERM_ADC_VREF    3.300f     // STM32 VDDA / ADC full-scale reference
+
+// Cleaned calibration curve generated from your measured NTC data.
+// Obvious non-physical outliers were rejected and the curve was forced to
+// decrease smoothly with temperature.  Resistance values are in kOhm.
+struct ThermCalPoint {
+  float tempC;
+  float resistanceK;
+};
+
+static const ThermCalPoint THERM_TABLE[] = {
+  {  0.0f, 33.604f },
+  {  5.0f, 24.903f },
+  { 10.0f, 18.985f },
+  { 15.0f, 14.823f },
+  { 20.0f, 11.810f },
+  { 25.0f,  9.570f },
+  { 30.0f,  7.866f },
+  { 35.0f,  6.543f },
+  { 40.0f,  5.496f },
+  { 45.0f,  4.654f },
+  { 50.0f,  3.967f },
+  { 55.0f,  3.400f },
+  { 60.0f,  2.926f },
+  { 65.0f,  2.527f },
+  { 70.0f,  2.188f },
+  { 75.0f,  1.898f },
+  { 80.0f,  1.649f },
+  { 85.0f,  1.433f },
+  { 90.0f,  1.247f },
+  { 95.0f,  1.085f },
+  {100.0f,  0.943f }
+};
+
+static const size_t THERM_TABLE_COUNT = sizeof(THERM_TABLE) / sizeof(THERM_TABLE[0]);
 
 // ---------------- Sampling / classification ----------------
 #define NSAMP 512
@@ -704,14 +738,58 @@ int readGainMode() {  // returns 1..4, or 0 = none active
   return 0;
 }
 
+float resistanceToTemperature(float resistanceK) {
+  // Calibrated range is 0..100 C.  Return N/A outside it instead of
+  // extrapolating a temperature that has not been calibrated.
+  if (resistanceK > THERM_TABLE[0].resistanceK ||
+      resistanceK < THERM_TABLE[THERM_TABLE_COUNT - 1].resistanceK) {
+    return NAN;
+  }
+
+  for (size_t i = 0; i < THERM_TABLE_COUNT - 1; i++) {
+    float r1 = THERM_TABLE[i].resistanceK;
+    float r2 = THERM_TABLE[i + 1].resistanceK;
+
+    // NTC resistance decreases as temperature rises.
+    if (resistanceK <= r1 && resistanceK >= r2) {
+      // Interpolate in ln(R), which follows the NTC curve much better than
+      // straight resistance interpolation between 5 C calibration points.
+      float lr  = logf(resistanceK);
+      float lr1 = logf(r1);
+      float lr2 = logf(r2);
+      float f = (lr - lr1) / (lr2 - lr1);
+      return THERM_TABLE[i].tempC +
+             f * (THERM_TABLE[i + 1].tempC - THERM_TABLE[i].tempC);
+    }
+  }
+
+  return NAN;
+}
+
 float readTemperature() {
+  // One dummy conversion helps the ADC settle after PA0 signal sampling.
+  (void)analogRead(THERM_PIN);
+  delayMicroseconds(40);
+
+  // Average several readings to reduce display jitter.
   uint32_t acc = 0;
-  for (int i = 0; i < 16; i++) acc += analogRead(THERM_PIN);
-  float adc = acc / 16.0f;
-  if (adc < 5 || adc > 4090) return NAN;  // open / short
-  float r = THERM_RSERIES * adc / (4095.0f - adc);
-  float tK = 1.0f / (logf(r / THERM_R25) / THERM_BETA + 1.0f / T0_KELVIN);
-  return tK - 273.15f;
+  const int n = 32;
+  for (int i = 0; i < n; i++) acc += analogRead(THERM_PIN);
+  float adc = acc / (float)n;
+
+  // Open/short protection.
+  if (adc < 5.0f || adc > 4090.0f) return NAN;
+
+  // Convert ADC count to the actual PA1 node voltage.
+  float vNode = adc * THERM_ADC_VREF / 4095.0f;
+  if (vNode <= 0.0f || vNode >= THERM_SUPPLY_V) return NAN;
+
+  // Divider: Vs -> Rfixed -> PA1 -> NTC -> GND
+  // Rntc = Rfixed * Vnode / (Vs - Vnode)
+  float resistanceOhm = THERM_RSERIES_OHM * vNode / (THERM_SUPPLY_V - vNode);
+  float resistanceK = resistanceOhm / 1000.0f;
+
+  return resistanceToTemperature(resistanceK);
 }
 
 // ================= Display update =================
